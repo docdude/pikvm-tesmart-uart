@@ -1,11 +1,11 @@
 [Unit]
-Description=TESmart HKS401 UART Controller
+Description=TESmart KVM UART controller
 After=local-fs.target
 Before=kvmd.service
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/hks401d
+ExecStart=/usr/local/bin/tesmartd
 Restart=on-failure
 RestartSec=2
 User=root

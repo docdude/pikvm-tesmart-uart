@@ -1,0 +1,1068 @@
+#!/usr/bin/env python3
+"""tesmartd: sole owner of a TESmart KVM UART (HKS401-M24, HKS802-M24, ...).
+
+Clients (PiKVM UGPIO plugin, CLI) talk to it over a Unix socket.
+"""
+
+import grp
+import http.client
+import json
+import os
+import selectors
+import socket
+import sys
+import time
+
+import serial
+
+CONFIG_PATH = os.environ.get("TESMART_CONFIG", "/etc/tesmart.conf")
+SOCKET_PATH = "/run/tesmartd.sock"
+STATE_PATH = "/run/tesmartd-state.json"
+BAUD = 9600
+
+MAX_PCS = 16
+OUTPUT_LETTERS = "ABCD"
+
+# Optional features. UI rows are generated only for supported features.
+FEATURES = (
+    "buzzer", "buzzer_levels", "lighting", "km_mode", "network", "mouse",
+    "fan", "audio_follow", "audio", "autoscan", "auto_detect", "scan_interval",
+    "mixed_focus",
+)
+
+# Feature -> query that proves it is supported (buzzer_levels has none).
+FEATURE_QUERIES = {
+    f: f for f in FEATURES if f != "buzzer_levels"
+}
+
+# Known units. "ports" is the 0x81 reply byte (PCs << 4 | outputs), which
+# MODEL=auto uses to pick a profile. Features any unit answers at runtime
+# (e.g. scan_interval on updated firmware) are added to these.
+MODELS = {
+    "HKS401-M24": {
+        "ports": 0x41,
+        "features": (
+            "buzzer", "lighting", "km_mode", "network", "mouse", "fan",
+            "audio_follow", "audio", "autoscan", "auto_detect",
+        ),
+    },
+    "HKS802-M24": {
+        "ports": 0x82,
+        "features": (
+            "buzzer", "buzzer_levels", "km_mode", "mouse", "fan", "audio",
+            "autoscan", "auto_detect", "mixed_focus",
+        ),
+    },
+}
+
+DEFAULT_CONFIG = {
+    "MODEL": "auto",
+    "PCS": "",
+    "OUTPUTS": "",
+    "FEATURES": "",
+    "PIKVM_OUTPUT": "",
+    "AUTOSCAN_CMD": "",
+    "SWITCH_LINK": "1",
+    "SERIAL_DEV": "/dev/ttyAMA0",
+}
+
+
+def load_config(path):
+    cfg = dict(DEFAULT_CONFIG)
+    try:
+        with open(path) as f:
+            lines = f.read().splitlines()
+    except FileNotFoundError:
+        return cfg
+    for line in lines:
+        line = line.split("#", 1)[0].strip()
+        if not line or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip().upper()
+        value = value.strip().strip("\"'")
+        if key in cfg:
+            cfg[key] = value
+        else:
+            print(f"CONFIG: ignoring unknown key {key}", flush=True)
+    return cfg
+
+
+def validate_config(cfg):
+    errors = []
+    model = cfg["MODEL"]
+    if model.lower() not in ("auto", "custom") and model.upper() not in MODELS:
+        errors.append(
+            f"MODEL={model} is unknown; use auto, custom or one of "
+            + ", ".join(MODELS)
+        )
+    if cfg["PCS"] and not (cfg["PCS"].isdigit() and 1 <= int(cfg["PCS"]) <= MAX_PCS):
+        errors.append(f"PCS must be 1-{MAX_PCS}")
+    if cfg["OUTPUTS"] and not (
+        cfg["OUTPUTS"].isdigit() and 1 <= int(cfg["OUTPUTS"]) <= len(OUTPUT_LETTERS)
+    ):
+        errors.append(f"OUTPUTS must be 1-{len(OUTPUT_LETTERS)}")
+    if cfg["PIKVM_OUTPUT"] and cfg["PIKVM_OUTPUT"].upper() not in OUTPUT_LETTERS:
+        errors.append(f"PIKVM_OUTPUT must be one of {', '.join(OUTPUT_LETTERS)}")
+    for name in filter(None, (f.strip() for f in cfg["FEATURES"].split(","))):
+        if name not in FEATURES:
+            errors.append(f"FEATURES: unknown feature {name}")
+    if cfg["AUTOSCAN_CMD"] and cfg["AUTOSCAN_CMD"].lower() not in ("0x0e", "0x0f"):
+        errors.append("AUTOSCAN_CMD must be 0x0E or 0x0F")
+    if model.lower() == "custom" and not (cfg["PCS"] and cfg["OUTPUTS"]):
+        errors.append("MODEL=custom needs PCS and OUTPUTS")
+    return errors
+
+
+config = load_config(CONFIG_PATH)
+
+# Two-way link between the PC on the output wired to PiKVM and the PiKVM
+# Switch (PC N <-> Switch port N). Root is a kvmd unix-socket "kvmd_user",
+# so no credentials are needed.
+SWITCH_LINK = config["SWITCH_LINK"] != "0"
+KVMD_SOCKET = "/run/kvmd/kvmd.sock"
+KVMD_TIMEOUT = 0.5
+SWITCH_POLL = 0.5
+SWITCH_RETRY = 5.0
+# How long to wait for the Switch to confirm a port we commanded, and for
+# the KVM to settle after a Switch-initiated selection, before either side
+# may drive the other again. Prevents ping-pong on stale reports.
+SWITCH_HOLD = 2.0
+
+SETTERS = {
+    # HKS401 treats any nonzero level as on; HKS802 has low/medium/high.
+    ("buzzer", "off"):    (0x04, 0x00, 0x00),
+    ("buzzer", "on"):     (0x04, 0x00, 0x01),
+    ("buzzer", "low"):    (0x04, 0x00, 0x01),
+    ("buzzer", "medium"): (0x04, 0x00, 0x02),
+    ("buzzer", "high"):   (0x04, 0x00, 0x03),
+
+    ("lighting", "off"):       (0x05, 0x02, 0x00),
+    ("lighting", "indicator"): (0x05, 0x02, 0x01),
+    ("lighting", "marquee"):   (0x05, 0x02, 0x02),
+    ("lighting", "breathing"): (0x05, 0x02, 0x03),
+
+    ("fan", "off"):  (0x0B, 0x00, 0x00),
+    ("fan", "auto"): (0x0B, 0x00, 0x01),
+    ("fan", "low"):  (0x0B, 0x00, 0x02),
+    ("fan", "high"): (0x0B, 0x00, 0x03),
+
+    ("mouse", "off"): (0x0A, 0x00, 0x00),
+    ("mouse", "on"):  (0x0A, 0x00, 0x01),
+
+    ("audio_follow", "off"): (0x0C, 0x00, 0x00),
+    ("audio_follow", "on"):  (0x0C, 0x00, 0x01),
+
+    ("audio", "next"): (0x0D, 0xFF, 0x00),
+    **{("audio", f"pc{n}"): (0x0D, 0x00, n - 1) for n in range(1, MAX_PCS + 1)},
+
+    # USB keyboard/mouse mode: passthrough beeps once, compatible twice.
+    ("km_mode", "passthrough"): (0x08, 0x00, 0x00),
+    ("km_mode", "compatible"):  (0x08, 0x00, 0x01),
+
+    # Auto Scan, as in TESmart's sheet (AUTOSCAN_CMD can swap it with 0x0E).
+    ("autoscan", "off"): (0x0F, 0x00, 0x00),
+    ("autoscan", "on"):  (0x0F, 0x00, 0x01),
+
+    # Auto Detect (not in the sheet): when on, the KVM switches to a newly
+    # attached source, or to the next active one when a source is removed.
+    ("auto_detect", "off"): (0x0E, 0x00, 0x00),
+    ("auto_detect", "on"):  (0x0E, 0x00, 0x01),
+
+    # Mixed-mode keyboard/mouse focus: a separate focus reported by 0x87
+    # (0x82 doesn't change). The HKS802 only accepts it while the outputs
+    # show different PCs; selecting all outputs resets it.
+    ("mixed_focus", "next"): (0x07, 0xFF, 0x00),
+    **{("mixed_focus", f"pc{n}"): (0x07, 0x00, n - 1) for n in range(1, MAX_PCS + 1)},
+}
+
+BUZZER_LEVELS = {0: "off", 1: "low", 2: "medium", 3: "high"}
+
+QUERIES = {
+    "ports":          (0x81, 0x00, 0x00),
+    "focus":          (0x82, 0x00, 0xFF),
+    "correspondence": (0x83, 0x00, 0xFF),
+    "buzzer":         (0x84, 0x00, 0xFF),
+    "lighting":       (0x85, 0x00, 0xFF),
+    # Mixed-mode K/M focus PC, then one PC per monitor (HKS802 lists B
+    # before A). Silent on the HKS401.
+    "mixed_focus":    (0x87, 0x00, 0xFF),
+    "km_mode":        (0x88, 0x00, 0xFF),
+    "network":        (0x89, 0x00, 0xFF),
+    "mouse":          (0x8A, 0x00, 0xFF),
+    "fan":            (0x8B, 0x00, 0xFF),
+    "audio_follow":   (0x8C, 0x00, 0xFF),
+    "audio":          (0x8D, 0x00, 0xFF),
+    "auto_detect":    (0x8E, 0x00, 0xFF),
+    # Auto Scan runtime status: 00=stopped, 01=running.
+    "autoscan":       (0x8F, 0x00, 0xFF),
+    # Auto Scan interval (seconds); only updated firmware answers.
+    "scan_interval":  (0x90, 0x00, 0xFF),
+}
+
+QUERY_NAMES_BY_CMD = {
+    data[0]: name
+    for name, data in QUERIES.items()
+}
+
+state = {
+    "model": None,
+    "ready": False,
+    # K/M focus PC; on single-output units also the displayed PC.
+    "active_pc": None,
+    "focus_pc": None,
+    # Output letter -> PC, from 0x83.
+    "outputs": {},
+    # PC on the output wired to PiKVM.
+    "monitor_pc": None,
+    "ports": {"pcs": None, "monitors": None, "raw": None},
+    "buzzer": None,
+    "lighting": None,
+    "km_mode": None,
+    "network_mask": None,
+    "network_ports": {},
+    "network_focus_pc": None,
+    "mouse": None,
+    "fan": None,
+    "audio_follow": None,
+    "audio_pc": None,
+    "mixed_focus_pc": None,
+    "autoscan": None,
+    "auto_detect": None,
+    "scan_interval": None,
+    "switch_port": None,
+    "responses": {},
+    "last_frame": None,
+    "last_update": None,
+}
+
+
+def make_frame(cmd, *data):
+    body = bytes((0xAA, 0xBB, cmd, *data))
+    return body + bytes((sum(body) & 0xFF,))
+
+
+def checksum_ok(frame):
+    return len(frame) >= 5 and (sum(frame[:-1]) & 0xFF) == frame[-1]
+
+
+def save_state():
+    tmp = STATE_PATH + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(state, f, separators=(",", ":"))
+    os.replace(tmp, STATE_PATH)
+
+
+def send(ser, packet):
+    ser.write(packet)
+    ser.flush()
+    print(f"TX {packet.hex(' ')}", flush=True)
+
+
+# ===== Model
+
+
+def resolve_model():
+    """Combine config, the 0x81 reply and answered queries into the model."""
+    raw = state["ports"]["raw"]
+    raw = int(raw, 16) if raw else None
+
+    wanted = config["MODEL"]
+    name = None
+    if wanted.lower() == "auto":
+        name = next((n for n, m in MODELS.items() if m["ports"] == raw), None)
+    elif wanted.lower() != "custom":
+        name = wanted.upper()
+    profile = MODELS.get(name)
+
+    def count(key, shift):
+        if config[key]:
+            return int(config[key])
+        source = profile["ports"] if profile else raw
+        value = (source >> shift) & 0x0F if source is not None else 0
+        return value or None
+
+    pcs = count("PCS", 4)
+    outputs = count("OUTPUTS", 0)
+    if pcs is None or outputs is None:
+        return None
+
+    answered = {f for f, q in FEATURE_QUERIES.items() if q in state["responses"]}
+    if config["FEATURES"]:
+        features = {f.strip() for f in config["FEATURES"].split(",") if f.strip()}
+    elif profile:
+        features = set(profile["features"]) | answered
+    else:
+        features = answered
+
+    letters = OUTPUT_LETTERS[:outputs]
+    pikvm_output = (config["PIKVM_OUTPUT"] or "A").upper()
+    if pikvm_output not in letters:
+        pikvm_output = "A"
+
+    autoscan_cmd = int(config["AUTOSCAN_CMD"] or "0x0F", 16)
+
+    if name is None:
+        name = f"TESmart {pcs}x{outputs}"
+    return {
+        "name": name,
+        "pcs": min(pcs, MAX_PCS),
+        "outputs": outputs,
+        "letters": letters,
+        "features": [f for f in FEATURES if f in features],
+        "pikvm_output": pikvm_output,
+        "autoscan_cmd": autoscan_cmd,
+        "source": "auto" if wanted.lower() == "auto" else "config",
+    }
+
+
+def apply_scan_cmd(autoscan_cmd):
+    """Point autoscan/auto_detect at 0x0E/0x0F in the unit's order."""
+    detect_cmd = 0x0E + 0x0F - autoscan_cmd
+    if QUERIES["autoscan"][0] == autoscan_cmd | 0x80:
+        return False
+    for name, cmd in (("autoscan", autoscan_cmd), ("auto_detect", detect_cmd)):
+        for value in ("off", "on"):
+            SETTERS[(name, value)] = (cmd, 0x00, 1 if value == "on" else 0)
+        QUERIES[name] = (cmd | 0x80, 0x00, 0xFF)
+        QUERY_NAMES_BY_CMD[cmd | 0x80] = name
+    return True
+
+
+def model_pcs():
+    return (state["model"] or {}).get("pcs") or 4
+
+
+def model_letters():
+    return (state["model"] or {}).get("letters") or "A"
+
+
+def has_feature(name):
+    return name in ((state["model"] or {}).get("features") or ())
+
+
+def update_model():
+    model = resolve_model()
+    if model != state["model"]:
+        state["model"] = model
+        if model:
+            print(
+                f"MODEL {model['name']}: {model['pcs']} PCs, "
+                f"{model['outputs']} output(s), PiKVM on {model['pikvm_output']}, "
+                f"features {','.join(model['features'])}",
+                flush=True,
+            )
+            # 0x84 decodes differently once buzzer_levels is known.
+            request_implicit("buzzer")
+            # AUTOSCAN_CMD=0x0E swaps the snapshot's 0x8E/0x8F; re-read.
+            if apply_scan_cmd(model["autoscan_cmd"]):
+                print(f"Auto Scan uses 0x{model['autoscan_cmd']:02X}", flush=True)
+                request_readback("autoscan")
+                request_readback("auto_detect")
+        refresh_monitor_pc()
+
+
+# ===== Readbacks
+
+# Wait after each send before resending or giving up. The HKS401 answers in
+# ~17 ms, but the HKS802 buffers replies for ~1.8 s after a switch.
+READBACK_DELAY = 0.02
+READBACK_WAITS = (0.15, 0.5, 1.0, 1.0)
+
+# Query name -> (monotonic time of next send, sends so far).
+readbacks = {}
+
+# Startup snapshot queries still unresolved; "ready" once empty.
+snapshot_pending = set()
+
+
+def request_readback(name, delay=READBACK_DELAY):
+    readbacks[name] = (time.monotonic() + delay, 0)
+
+
+def request_implicit(name, delay=READBACK_DELAY):
+    # Side-effect refreshes only for queries this unit has answered, so
+    # unsupported ones don't log NO REPLY on every switch.
+    if name in state["responses"] and name not in readbacks:
+        request_readback(name, delay)
+
+
+def resolve_snapshot(name):
+    if name in snapshot_pending:
+        snapshot_pending.discard(name)
+        if not snapshot_pending:
+            state["ready"] = True
+            update_model()
+            save_state()
+
+
+def service_readbacks(ser):
+    for name, (due, sent) in list(readbacks.items()):
+        now = time.monotonic()
+        if due > now:
+            continue
+        if sent == len(READBACK_WAITS):
+            print(f"NO REPLY to {name} query", flush=True)
+            del readbacks[name]
+            resolve_snapshot(name)
+            continue
+        send(ser, make_frame(*QUERIES[name]))
+        readbacks[name] = (now + READBACK_WAITS[sent], sent + 1)
+        # Keep consecutive frames apart on the 9600-baud link.
+        time.sleep(0.05)
+
+
+# Auto Scan PC transitions are UART-silent, so poll focus while it runs.
+# The rate is independent of the scan interval, which the keyboard can
+# change without UART traffic. Auto Scan status is re-checked to notice a stop.
+AUTOSCAN_FOCUS_POLL = 1.0
+AUTOSCAN_STATUS_POLL = 5.0
+
+autoscan_polls = {"focus": 0.0, "autoscan": 0.0, "scan_interval": 0.0}
+
+# Cycle for "set scan_interval next"; matches the PiKVM UI presets.
+SCAN_PRESETS = (5, 10, 15, 30, 60)
+
+# The HKS802 ignores a select that arrives while it is still busy with the
+# previous switch, so each select is re-sent until 0x83 confirms it.
+SELECT_VERIFY = 1.5
+SELECT_RETRIES = 2
+
+# {"pc", "output", "due", "retries"} for the last unconfirmed select.
+pending_select = None
+
+
+def select_confirmed():
+    letters = [pending_select["output"]] if pending_select["output"] else model_letters()
+    return all(state["outputs"].get(letter) == pending_select["pc"] for letter in letters)
+
+
+def service_select(ser):
+    global pending_select
+    if pending_select is None or time.monotonic() < pending_select["due"]:
+        return
+    target = f"{pending_select['output'] or 'all'} PC{pending_select['pc']}"
+    if pending_select["retries"] == 0:
+        print(f"SELECT {target} not confirmed", flush=True)
+        pending_select = None
+        return
+    print(f"SELECT {target} not confirmed, re-sending", flush=True)
+    pending_select["retries"] -= 1
+    select_pc(ser, pending_select["pc"], pending_select["output"], retry=True)
+
+
+def service_autoscan(ser):
+    if state["autoscan"] != "on":
+        return
+    now = time.monotonic()
+    polls = [
+        ("focus", AUTOSCAN_FOCUS_POLL),
+        ("autoscan", AUTOSCAN_STATUS_POLL),
+    ]
+    # Keyboard interval changes are UART-silent. Only firmware that has
+    # answered 0x90 is polled, so stock units don't log NO REPLY.
+    if "scan_interval" in state["responses"]:
+        polls.append(("scan_interval", AUTOSCAN_STATUS_POLL))
+    for name, period in polls:
+        if now >= autoscan_polls[name] and name not in readbacks:
+            request_readback(name, 0)
+            autoscan_polls[name] = now + period
+
+
+# ===== PiKVM Switch link
+
+
+class _KvmdConnection(http.client.HTTPConnection):
+    def __init__(self):
+        super().__init__("localhost", timeout=KVMD_TIMEOUT)
+
+    def connect(self):
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.sock.settimeout(self.timeout)
+        self.sock.connect(KVMD_SOCKET)
+
+
+def kvmd_request(method, path):
+    conn = _KvmdConnection()
+    try:
+        conn.request(method, path)
+        response = json.loads(conn.getresponse().read())
+    finally:
+        conn.close()
+    if not response.get("ok"):
+        raise RuntimeError(f"kvmd {method} {path}: {response.get('result')}")
+    return response["result"]
+
+
+# next_poll: monotonic time of the next GET /switch.
+# hold_until: no propagation in either direction before this time.
+# expect_port: port we commanded and are waiting for the Switch to report.
+# nports: Switch ports (4 per unit); PCs beyond it have no Switch port.
+switch_link = {
+    "next_poll": 0.0, "hold_until": 0.0, "expect_port": None,
+    "online": False, "nports": 0,
+}
+
+
+def service_switch_link(ser):
+    if not SWITCH_LINK or not state["model"]:
+        return
+    now = time.monotonic()
+
+    if now >= switch_link["next_poll"]:
+        try:
+            result = kvmd_request("GET", "/switch")
+            port = result["summary"]["active_port"]
+            switch_link["nports"] = len(result["model"]["ports"])
+        except Exception as ex:
+            if switch_link["online"]:
+                print(f"SWITCH link offline: {ex}", flush=True)
+            switch_link["online"] = False
+            switch_link["next_poll"] = now + SWITCH_RETRY
+            return
+        if not switch_link["online"]:
+            print(f"SWITCH link online ({switch_link['nports']} ports)", flush=True)
+            switch_link["online"] = True
+        switch_link["next_poll"] = now + SWITCH_POLL
+        port = int(port) if 0 <= port < switch_link["nports"] else None
+        prev = state["switch_port"]
+        if port != prev:
+            state["switch_port"] = port
+            save_state()
+
+        expect = switch_link["expect_port"]
+        if expect is not None:
+            if port == expect or now >= switch_link["hold_until"]:
+                switch_link["expect_port"] = None
+            return
+
+        # A change we didn't command: someone used the PiKVM Switch.
+        if (
+            prev is not None and port is not None and port != prev
+            and now >= switch_link["hold_until"]
+            and port + 1 <= model_pcs()
+            and state["monitor_pc"] != port + 1
+        ):
+            output = link_output()
+            print(f"SWITCH port {port + 1} -> {output or 'all'} PC{port + 1}", flush=True)
+            select_pc(ser, port + 1, output)
+            switch_link["hold_until"] = now + SWITCH_HOLD
+            return
+
+    pc = state["monitor_pc"]
+    port = state["switch_port"]
+    if (
+        switch_link["online"] and pc is not None and port is not None
+        and pending_select is None
+        and pc <= switch_link["nports"]
+        and port != pc - 1 and now >= switch_link["hold_until"]
+    ):
+        print(f"PC{pc} -> SWITCH port {pc}", flush=True)
+        try:
+            kvmd_request("POST", f"/switch/set_active?port={pc - 1}")
+        except Exception as ex:
+            print(f"SWITCH set_active failed: {ex}", flush=True)
+            switch_link["next_poll"] = now + SWITCH_RETRY
+        switch_link["expect_port"] = pc - 1
+        switch_link["hold_until"] = now + SWITCH_HOLD
+
+
+def link_output():
+    # Single-output units use the all-outputs select, which is verified.
+    if len(model_letters()) == 1:
+        return None
+    return state["model"]["pikvm_output"]
+
+
+# ===== RX
+
+
+def apply_network_mask(mask):
+    state["network_mask"] = f"0x{mask:02x}"
+    state["network_ports"] = {
+        f"pc{i + 1}": bool(mask & (1 << i)) for i in range(min(model_pcs(), 8))
+    }
+
+
+def refresh_monitor_pc():
+    model = state["model"]
+    letter = model["pikvm_output"] if model else "A"
+    state["monitor_pc"] = state["outputs"].get(letter)
+
+
+def process_frame(frame):
+    cmd = frame[2]
+    length = frame[3]
+    payload = frame[4:4 + length]
+
+    state["last_frame"] = frame.hex(" ")
+    state["last_update"] = time.time()
+
+    query_name = QUERY_NAMES_BY_CMD.get(cmd)
+    if query_name is not None:
+        first = query_name not in state["responses"]
+        state["responses"][query_name] = payload.hex(" ")
+        solicited = readbacks.pop(query_name, None) is not None
+        resolve_snapshot(query_name)
+
+        # Unsolicited 0x82/0x83 snapshots accompany physical switching and
+        # keyboard Auto Scan start/stop, which its status query does not announce.
+        if cmd in (0x82, 0x83) and not solicited:
+            request_implicit("autoscan", 0)
+
+        if first and state["ready"]:
+            update_model()
+
+    # 0x81: PCs (high nibble) and monitors/outputs (low nibble).
+    # HKS401-M24: 0x41, HKS802-M24: 0x82.
+    if cmd == 0x81 and length >= 1:
+        raw = payload[0]
+        state["ports"] = {
+            "pcs": (raw >> 4) & 0x0F,
+            "monitors": raw & 0x0F,
+            "raw": f"{raw:02x}",
+        }
+        update_model()
+
+    # 0x82: keyboard/mouse focus, 00.. = PC1..
+    elif cmd == 0x82 and length >= 1 and payload[0] < MAX_PCS:
+        pc = payload[0] + 1
+        # PC switches silently change 0x89's focus byte, the audio PC and,
+        # on multi-output units, the outputs that followed the switch.
+        if pc != state["focus_pc"]:
+            request_implicit("network", 0)
+            request_implicit("audio", 0)
+            request_implicit("correspondence", 0)
+        state["focus_pc"] = pc
+        state["active_pc"] = pc
+
+    # 0x83: (monitor, PC) pairs, monitor 1.. = output A..
+    # HKS802 example: 01 03 02 03 = A on PC4, B on PC4.
+    elif cmd == 0x83 and length >= 2:
+        for i in range(0, length - 1, 2):
+            monitor, pc = payload[i], payload[i + 1] + 1
+            if 1 <= monitor <= len(OUTPUT_LETTERS) and pc <= MAX_PCS:
+                state["outputs"][OUTPUT_LETTERS[monitor - 1]] = pc
+        refresh_monitor_pc()
+        if len(model_letters()) == 1 and "A" in state["outputs"]:
+            state["active_pc"] = state["outputs"]["A"]
+        global pending_select
+        if pending_select is not None and select_confirmed():
+            pending_select = None
+
+    # 0x84: buzzer, 00=off, 01-03=volume (HKS401: any nonzero = on).
+    elif cmd == 0x84 and length >= 1:
+        if has_feature("buzzer_levels"):
+            state["buzzer"] = BUZZER_LEVELS.get(payload[0], f"unknown_{payload[0]:02x}")
+        else:
+            state["buzzer"] = "on" if payload[0] else "off"
+
+    # 0x85: lighting. Observed payload 04 mode.
+    elif cmd == 0x85 and length >= 2:
+        state["lighting"] = {0: "off", 1: "indicator", 2: "marquee", 3: "breathing"}.get(
+            payload[1], f"unknown_{payload[1]:02x}"
+        )
+
+    # 0x87: mixed-mode K/M focus PC (first byte), 00.. = PC1..
+    elif cmd == 0x87 and length >= 1 and payload[0] < MAX_PCS:
+        state["mixed_focus_pc"] = payload[0] + 1
+
+    # 0x88: KM mode, 00=passthrough, 01=compatible.
+    elif cmd == 0x88 and length >= 1 and payload[0] in (0, 1):
+        state["km_mode"] = "compatible" if payload[0] else "passthrough"
+
+    # 0x89: Ethernet enable mask + K/M focus. Bit N = PC N+1.
+    elif cmd == 0x89 and length >= 2:
+        apply_network_mask(payload[0])
+        if payload[1] < MAX_PCS:
+            state["network_focus_pc"] = payload[1] + 1
+
+    # 0x8A: mouse-wheel switching, 00=off, 01=on.
+    elif cmd == 0x8A and length >= 1 and payload[0] in (0, 1):
+        state["mouse"] = "on" if payload[0] else "off"
+
+    # 0x8B: fan. Observed payload 04 mode.
+    elif cmd == 0x8B and length >= 2:
+        state["fan"] = {0: "off", 1: "auto", 2: "low", 3: "high"}.get(
+            payload[1], f"unknown_{payload[1]:02x}"
+        )
+
+    # 0x8C: audio-follow, 00=off, 01=on.
+    elif cmd == 0x8C and length >= 1 and payload[0] in (0, 1):
+        state["audio_follow"] = "on" if payload[0] else "off"
+
+    # 0x8D: selected audio PC, 00.. = PC1..
+    elif cmd == 0x8D and length >= 1 and payload[0] < MAX_PCS:
+        state["audio_pc"] = payload[0] + 1
+
+    # Auto Scan runtime status (0x8F). The KVM echoes the set's second
+    # byte, so any nonzero value means running.
+    elif query_name == "autoscan" and length >= 1:
+        state["autoscan"] = "on" if payload[0] else "off"
+
+    # Auto Detect (0x8E), 00=off, 01=on.
+    elif query_name == "auto_detect" and length >= 1 and payload[0] in (0, 1):
+        state["auto_detect"] = "on" if payload[0] else "off"
+
+    # 0x90: Auto Scan interval, big-endian seconds (firmware-updated units).
+    elif cmd == 0x90 and length >= 2:
+        state["scan_interval"] = (payload[0] << 8) | payload[1]
+
+    save_state()
+
+    print(
+        f"RX {frame.hex(' ')}"
+        f"  cmd=0x{cmd:02X} len={length}"
+        f" focus={state['focus_pc']} outputs={state['outputs']}",
+        flush=True,
+    )
+
+
+rxbuf = bytearray()
+
+
+def parse_rx(data):
+    global rxbuf
+    rxbuf.extend(data)
+
+    while True:
+        # Synchronize to AA BB.
+        pos = rxbuf.find(b"\xAA\xBB")
+
+        if pos < 0:
+            # Preserve AA in case BB arrives in the next read.
+            if rxbuf[-1:] == b"\xAA":
+                rxbuf = bytearray(b"\xAA")
+            else:
+                rxbuf.clear()
+            return
+
+        if pos:
+            del rxbuf[:pos]
+
+        # AA BB CMD LEN
+        if len(rxbuf) < 4:
+            return
+
+        payload_len = rxbuf[3]
+        frame_len = payload_len + 5
+
+        # Protect against nonsense length after corruption.
+        if payload_len > 64:
+            del rxbuf[0]
+            continue
+
+        if len(rxbuf) < frame_len:
+            return
+
+        frame = bytes(rxbuf[:frame_len])
+
+        if not checksum_ok(frame):
+            print(f"BAD CHECKSUM {frame.hex(' ')}", flush=True)
+            # Shift one byte and resynchronize.
+            del rxbuf[0]
+            continue
+
+        del rxbuf[:frame_len]
+        process_frame(frame)
+
+
+# ===== Commands
+
+
+def select_pc(ser, pc, output=None, retry=False):
+    global pending_select
+    # 0x03 second byte: 00 = all outputs, 01.. = output A..
+    index = 0 if output is None else OUTPUT_LETTERS.index(output) + 1
+    send(ser, make_frame(0x03, index, pc - 1))
+    if not retry:
+        pending_select = {"pc": pc, "output": output, "retries": SELECT_RETRIES}
+    pending_select["due"] = time.monotonic() + SELECT_VERIFY
+
+    # Assume success until the readbacks below confirm it.
+    if output is None:
+        state["active_pc"] = pc
+        for letter in model_letters():
+            state["outputs"][letter] = pc
+    else:
+        state["outputs"][output] = pc
+    refresh_monitor_pc()
+    save_state()
+
+    # The HKS401 sends no 0x82/0x83 after UART selection; the HKS802 sends
+    # 0x82 only. Query both, plus what follows a switch (audio PC and the
+    # mixed-mode focus, which an all-outputs select resets).
+    request_readback("focus")
+    request_readback("correspondence")
+    request_implicit("audio")
+    request_implicit("mixed_focus")
+
+
+def select_command(ser, args):
+    letters = model_letters()
+    output = None
+    if len(args) == 2:
+        output = args[0].upper()
+        if output not in letters:
+            return {"ok": False, "error": f"output must be one of {', '.join(letters)}"}
+        if len(letters) == 1:
+            output = None
+        args = args[1:]
+
+    target = args[0]
+    pcs = model_pcs()
+
+    if target == "next":
+        if output is None:
+            global pending_select
+            pending_select = None
+            send(ser, make_frame(0x03, 0xFF, 0x00))
+            request_readback("focus")
+            request_readback("correspondence")
+            request_implicit("audio")
+            return {"ok": True, "selected": "next"}
+        # The KVM has no per-output "next" (03 0N FF is ignored).
+        current = state["outputs"].get(output)
+        if current is None:
+            return {"ok": False, "error": f"output {output} PC unknown"}
+        pc = current % pcs + 1
+    else:
+        try:
+            pc = int(target)
+        except ValueError:
+            return {"ok": False, "error": "invalid PC"}
+        if not 1 <= pc <= pcs:
+            return {"ok": False, "error": f"PC must be 1-{pcs} or next"}
+
+    select_pc(ser, pc, output)
+    result = {"ok": True, "selected": pc}
+    if output:
+        result["output"] = output
+    return result
+
+
+def set_network(ser, name, value):
+    nbits = min(model_pcs(), 8)
+    if name == "network_mask":
+        try:
+            mask = int(value, 16)
+        except ValueError:
+            return {"ok": False, "error": "invalid mask"}
+    elif name.startswith("network_pc") and name[10:].isdigit():
+        n = int(name[10:])
+        if not 1 <= n <= nbits:
+            return {"ok": False, "error": "unknown setting/value"}
+        if value not in ("on", "off"):
+            return {"ok": False, "error": "value must be on/off"}
+        if state["network_mask"] is None:
+            return {"ok": False, "error": "network state unknown"}
+        bit = 1 << (n - 1)
+        mask = int(state["network_mask"], 16)
+        mask = (mask | bit) if value == "on" else (mask & ~bit)
+    else:
+        return {"ok": False, "error": "unknown setting/value"}
+
+    if not 0 <= mask < (1 << nbits):
+        return {"ok": False, "error": f"mask must be 0x00-0x{(1 << nbits) - 1:02x}"}
+
+    send(ser, make_frame(0x09, 0x00, mask))
+    # Update immediately so back-to-back per-PC toggles compose correctly.
+    apply_network_mask(mask)
+    save_state()
+
+    request_readback("network")
+
+    return {"ok": True, "setting": name, "value": value, "mask": f"0x{mask:02x}"}
+
+
+def set_scan_interval(ser, value):
+    # Set Auto Scan interval: AA BB 10 00 HH LL CC (no response frame).
+    # Range is 5-3600 seconds, high byte first. Requires updated TESmart
+    # firmware; harmless (silent) on stock units.
+    if value == "next":
+        current = state["scan_interval"]
+        if current is None:
+            return {"ok": False, "error": "scan interval unknown"}
+        # Next preset above the current value, rolling over to the first.
+        value = str(next((p for p in SCAN_PRESETS if p > current), SCAN_PRESETS[0]))
+
+    try:
+        seconds = int(value)
+    except ValueError:
+        return {"ok": False, "error": "interval must be an integer (seconds)"}
+
+    if not 5 <= seconds <= 3600:
+        return {"ok": False, "error": "interval must be 5-3600 seconds"}
+
+    send(ser, make_frame(0x10, 0x00, (seconds >> 8) & 0xFF, seconds & 0xFF))
+
+    # The 0x10 set is fire-and-forget, so assume success until the 0x90
+    # readback below confirms the value (silent on pre-update firmware).
+    state["scan_interval"] = seconds
+    save_state()
+
+    request_readback("scan_interval")
+
+    return {"ok": True, "setting": "scan_interval", "value": seconds}
+
+
+def handle_command(ser, text):
+    parts = text.strip().lower().split()
+
+    if not parts:
+        return {"ok": False, "error": "empty command"}
+
+    if parts[0] == "select" and len(parts) in (2, 3):
+        return select_command(ser, parts[1:])
+
+    if parts[0] == "set" and len(parts) == 3 and parts[1].startswith("network_"):
+        return set_network(ser, parts[1], parts[2])
+
+    if parts[0] == "set" and len(parts) == 3 and parts[1] == "scan_interval":
+        return set_scan_interval(ser, parts[2])
+
+    if parts[0] == "set" and len(parts) == 3:
+        key = (parts[1], parts[2])
+
+        if key not in SETTERS:
+            return {"ok": False, "error": "unknown setting/value"}
+        if parts[1] in ("audio", "mixed_focus") and parts[2] != "next" \
+                and int(parts[2][2:]) > model_pcs():
+            return {"ok": False, "error": f"{parts[1]} must be pc1-pc{model_pcs()} or next"}
+
+        send(ser, make_frame(*SETTERS[key]))
+
+        # Assume success until the readback below arrives, so clients
+        # polling in between don't see the old value.
+        if parts[1] in ("audio", "mixed_focus"):
+            if parts[2] != "next":
+                state[f"{parts[1]}_pc"] = int(parts[2][2:])
+        elif parts[1] == "buzzer" and parts[2] == "on" and has_feature("buzzer_levels"):
+            state["buzzer"] = "low"
+        else:
+            state[parts[1]] = parts[2]
+        save_state()
+
+        # Confirm against the hardware.
+        request_readback(parts[1])
+
+        return {"ok": True, "setting": parts[1], "value": parts[2]}
+
+    if parts[0] == "query" and len(parts) == 2:
+        name = parts[1]
+
+        if name not in QUERIES:
+            return {
+                "ok": False,
+                "error": "unknown query",
+                "queries": sorted(QUERIES),
+            }
+
+        request_readback(name, 0)
+        return {"ok": True, "query": name}
+
+    if parts[0] == "state":
+        return {"ok": True, "state": state}
+
+    if parts[0] == "model":
+        return {"ok": True, "ready": state["ready"], "model": state["model"]}
+
+    return {
+        "ok": False,
+        "error": (
+            "use: select [OUTPUT] PC|next | set NAME VALUE | "
+            "query NAME | state | model"
+        ),
+    }
+
+
+def main():
+    errors = validate_config(config)
+    if errors:
+        for error in errors:
+            print(f"CONFIG ERROR ({CONFIG_PATH}): {error}", file=sys.stderr, flush=True)
+        sys.exit(1)
+
+    try:
+        os.unlink(SOCKET_PATH)
+    except FileNotFoundError:
+        pass
+
+    with serial.Serial(
+        config["SERIAL_DEV"],
+        BAUD,
+        bytesize=8,
+        parity=serial.PARITY_NONE,
+        stopbits=1,
+        timeout=0,
+    ) as ser:
+
+        ser.reset_input_buffer()
+
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        server.bind(SOCKET_PATH)
+        os.chown(SOCKET_PATH, 0, grp.getgrnam("uucp").gr_gid)
+        os.chmod(SOCKET_PATH, 0o660)
+        server.listen(8)
+        server.setblocking(False)
+
+        sel = selectors.DefaultSelector()
+        sel.register(ser.fileno(), selectors.EVENT_READ, "serial")
+        sel.register(server, selectors.EVENT_READ, "server")
+
+        print(
+            f"tesmartd: {config['SERIAL_DEV']} @ {BAUD}, MODEL={config['MODEL']}",
+            flush=True,
+        )
+
+        # Establish a complete initial hardware snapshot; the model (and
+        # "ready") is settled once every query has answered or timed out.
+        update_model()
+        for name in QUERIES:
+            request_readback(name, 0)
+            snapshot_pending.add(name)
+        save_state()
+
+        while True:
+            if readbacks:
+                timeout = 0.05
+            elif state["autoscan"] == "on":
+                timeout = 0.25
+            elif SWITCH_LINK:
+                timeout = SWITCH_POLL
+            else:
+                timeout = 1.0
+
+            for key, _ in sel.select(timeout=timeout):
+
+                if key.data == "serial":
+                    data = os.read(ser.fileno(), 256)
+                    if data:
+                        parse_rx(data)
+
+                elif key.data == "server":
+                    conn, _ = server.accept()
+
+                    with conn:
+                        conn.settimeout(1.0)
+
+                        try:
+                            request = conn.recv(1024).decode(
+                                "ascii", errors="replace"
+                            )
+                            result = handle_command(ser, request)
+                        except Exception as ex:
+                            result = {"ok": False, "error": str(ex)}
+
+                        conn.sendall(
+                            (json.dumps(result) + "\n").encode("utf-8")
+                        )
+
+            service_autoscan(ser)
+            service_select(ser)
+            service_switch_link(ser)
+            service_readbacks(ser)
+
+
+if __name__ == "__main__":
+    main()

@@ -21,9 +21,22 @@ from . import BaseUserGpioDriver
 from . import GpioDriverOfflineError
 
 
-# Mutually exclusive pins: pin -> (state key, selected value, daemon command).
+# Upper bounds; each unit's generated UI uses a subset of these pins.
+_MAX_PCS: Final[int] = 16
+_OUTPUTS: Final[str] = "abcd"
+
+# Mutually exclusive pins: pin -> (state key path, selected value, daemon command).
 _CHOICE_PINS: Final[dict[str, tuple[str, Any, str]]] = {
-    **{f"pc{n}": ("active_pc", n, f"select {n}") for n in range(1, 5)},
+    **{f"pc{n}": ("active_pc", n, f"select {n}") for n in range(1, _MAX_PCS + 1)},
+    **{
+        f"out_{o}_pc{n}": (f"outputs.{o.upper()}", n, f"select {o} {n}")
+        for o in _OUTPUTS
+        for n in range(1, _MAX_PCS + 1)
+    },
+    **{
+        f"buzzer_{m}": ("buzzer", m, f"set buzzer {m}")
+        for m in ("off", "low", "medium", "high")
+    },
     **{
         f"lighting_{m}": ("lighting", m, f"set lighting {m}")
         for m in ("off", "indicator", "marquee", "breathing")
@@ -32,7 +45,11 @@ _CHOICE_PINS: Final[dict[str, tuple[str, Any, str]]] = {
         f"fan_{m}": ("fan", m, f"set fan {m}")
         for m in ("off", "auto", "low", "high")
     },
-    **{f"audio_pc{n}": ("audio_pc", n, f"set audio pc{n}") for n in range(1, 5)},
+    **{f"audio_pc{n}": ("audio_pc", n, f"set audio pc{n}") for n in range(1, _MAX_PCS + 1)},
+    **{
+        f"mixed_pc{n}": ("mixed_focus_pc", n, f"set mixed_focus pc{n}")
+        for n in range(1, _MAX_PCS + 1)
+    },
     **{
         f"km_{m}": ("km_mode", m, f"set km_mode {m}")
         for m in ("passthrough", "compatible")
@@ -50,26 +67,35 @@ _BOOL_PINS: Final[dict[str, str]] = {
     "mouse": "mouse",
     "audio_follow": "audio_follow",
     "auto_detect": "auto_detect",
-    **{f"net_pc{n}": f"network_pc{n}" for n in range(1, 5)},
+    **{f"net_pc{n}": f"network_pc{n}" for n in range(1, 9)},
 }
 
 # Momentary pins for pulse buttons: pin -> daemon command.
 _PULSE_PINS: Final[dict[str, str]] = {
     "pc_next": "select next",
+    **{f"out_{o}_next": f"select {o} next" for o in _OUTPUTS},
     "audio_next": "set audio next",
+    "mixed_next": "set mixed_focus next",
     "scan_next": "set scan_interval next",
 }
 
 # Read-only pins for mode: input: pin -> (state key, value).
 _INPUT_PINS: Final[dict[str, tuple[str, Any]]] = {
-    f"net_focus_pc{n}": ("network_focus_pc", n) for n in range(1, 5)
+    f"net_focus_pc{n}": ("network_focus_pc", n) for n in range(1, 9)
 }
 
 _ALL_PINS: Final[tuple[str, ...]] = (*_CHOICE_PINS, *_BOOL_PINS, *_INPUT_PINS, *_PULSE_PINS)
 
 
 def _valid_pin(arg: Any) -> str:
-    return check_string_in_list(arg, "HKS401 pin", _ALL_PINS)
+    return check_string_in_list(arg, "TESmart pin", _ALL_PINS)
+
+
+def _get(state: dict, path: str) -> Any:
+    value: Any = state
+    for key in path.split("."):
+        value = (value or {}).get(key)
+    return value
 
 
 def _read_pin(state: dict, pin: str) -> bool:
@@ -77,7 +103,7 @@ def _read_pin(state: dict, pin: str) -> bool:
         return False
     if pin in _CHOICE_PINS:
         (key, value, _) = _CHOICE_PINS[pin]
-        return (state.get(key) == value)
+        return (_get(state, key) == value)
     if pin in _INPUT_PINS:
         (key, value) = _INPUT_PINS[pin]
         return (state.get(key) == value)
@@ -104,12 +130,13 @@ class Plugin(BaseUserGpioDriver):
         self.__state: dict = {}
         self.__online: bool = False
         self.__update_notifier = aiotools.AioNotifier()
+        self.__pins: set[str] = set()
 
     @classmethod
     def get_plugin_options(cls) -> dict:
         return {
             "socket": Option(
-                "/run/hks401d.sock",
+                "/run/tesmartd.sock",
                 type=valid_abs_path,
             ),
             "timeout": Option(
@@ -126,6 +153,14 @@ class Plugin(BaseUserGpioDriver):
     def get_pin_validator(cls) -> Callable[[Any], Any]:
         return _valid_pin
 
+    def register_input(self, pin: str, debounce: float) -> None:
+        _ = debounce
+        self.__pins.add(pin)
+
+    def register_output(self, pin: str, initial: (bool | None)) -> None:
+        _ = initial
+        self.__pins.add(pin)
+
     async def run(self) -> None:
         prev: tuple | None = None
 
@@ -137,7 +172,7 @@ class Plugin(BaseUserGpioDriver):
             except Exception as ex:
                 if self.__online:
                     get_logger(0).error(
-                        "Lost connection to HKS401 daemon: %s",
+                        "Lost connection to tesmartd: %s",
                         tools.efmt(ex),
                     )
 
@@ -146,7 +181,7 @@ class Plugin(BaseUserGpioDriver):
 
             snapshot = (
                 self.__online,
-                *(_read_pin(self.__state, pin) for pin in _ALL_PINS),
+                *(_read_pin(self.__state, pin) for pin in sorted(self.__pins)),
             )
             if snapshot != prev:
                 self._notifier.notify()
@@ -182,7 +217,7 @@ class Plugin(BaseUserGpioDriver):
             await self.__command(command)
         except Exception as ex:
             get_logger(0).error(
-                "Can't apply HKS401 %r: %s",
+                "Can't apply TESmart %r: %s",
                 command,
                 tools.efmt(ex),
             )
@@ -214,13 +249,13 @@ class Plugin(BaseUserGpioDriver):
             )
 
             if not raw:
-                raise RuntimeError("Empty response from hks401d")
+                raise RuntimeError("Empty response from tesmartd")
 
             response = json.loads(raw.decode())
 
             if not response.get("ok"):
                 raise RuntimeError(
-                    response.get("error", "hks401d command failed")
+                    response.get("error", "tesmartd command failed")
                 )
 
             return response
@@ -234,6 +269,6 @@ class Plugin(BaseUserGpioDriver):
                     pass
 
     def __str__(self) -> str:
-        return f"HKS401({self._instance_name})"
+        return f"TESmart({self._instance_name})"
 
     __repr__ = __str__

@@ -1,0 +1,35 @@
+# tesmartd configuration. deploy.sh installs this as /etc/tesmart.conf
+# only if that file doesn't exist yet. After editing, run:
+#   systemctl restart tesmartd kvmd
+# kvmd regenerates its TESmart controls from the settled model on start.
+
+# auto        Identify the unit from its 0x81 reply and show only the
+#             features it answers (default).
+# HKS401-M24  4 PCs, 1 output.
+# HKS802-M24  8 PCs, 2 outputs (A/B), buzzer volume levels.
+# custom      Unknown unit; set PCS and OUTPUTS below.
+MODEL=auto
+
+# Override the PC (input) and output (monitor) counts, e.g. PCS=8 OUTPUTS=2.
+#PCS=
+#OUTPUTS=
+
+# Replace the feature list (comma-separated) instead of using the model's:
+# buzzer, buzzer_levels, lighting, km_mode, network, mouse, fan,
+# audio_follow, audio, autoscan, auto_detect, scan_interval, mixed_focus
+#FEATURES=
+
+# Command that starts Auto Scan; the other one of 0x0E/0x0F is Auto Detect.
+# TESmart's sheet (and the HKS401/HKS802) use 0x0F; set 0x0E only for a
+# unit whose Auto Scan button turns on Auto Detect instead.
+#AUTOSCAN_CMD=0x0F
+
+# Output wired to PiKVM's video capture (A, B, ...). The PiKVM Switch link
+# follows the PC on this output and marks its row "(PiKVM)".
+PIKVM_OUTPUT=A
+
+# Two-way link with a PiKVM Switch: KVM PC N <-> Switch port N.
+# PCs beyond the Switch's port count leave the Switch where it is.
+SWITCH_LINK=1
+
+#SERIAL_DEV=/dev/ttyAMA0

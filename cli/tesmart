@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
+"""Command-line client for tesmartd."""
 
 import json
 import socket
 import sys
 
-SOCKET = "/run/hks401d.sock"
+SOCKET = "/run/tesmartd.sock"
 
 QUERIES = (
     "ports",
@@ -21,12 +22,18 @@ QUERIES = (
     "autoscan",
     "auto_detect",
     "scan_interval",
+    "mixed_focus",
 )
+
 
 def usage():
     print(
         f"Usage: {sys.argv[0]} "
-        "{1|2|3|4|next|state|query <name>|set <name> <value>}",
+        "{PC|next|OUTPUT PC|OUTPUT next|state|model|query <name>|set <name> <value>}",
+        file=sys.stderr,
+    )
+    print(
+        "  PC selects all outputs (1-N); OUTPUT is a, b, ... on multi-output units.",
         file=sys.stderr,
     )
     print(
@@ -34,33 +41,36 @@ def usage():
         file=sys.stderr,
     )
     print(
-        "Set examples: buzzer on|off, "
+        "Set examples: buzzer on|off|low|medium|high, "
         "km_mode passthrough|compatible, "
         "lighting off|indicator|marquee|breathing, "
-        "fan off|auto|low|high, audio pc1-pc4|next, "
-        "network_pc1-4 on|off, network_mask 0x00-0x0f, "
+        "fan off|auto|low|high, audio pc1-pcN|next, mixed_focus pc1-pcN|next, "
+        "network_pcN on|off, network_mask 0xNN, "
         "scan_interval 5-3600|next (needs updated firmware)",
         file=sys.stderr,
     )
 
 
-if len(sys.argv) == 2:
-    arg = sys.argv[1]
+def is_target(arg):
+    return arg == "next" or arg.isdigit()
 
-    if arg in ("1", "2", "3", "4", "next"):
-        command = f"select {arg}\n"
-        mode = "select"
 
-    elif arg == "state":
-        command = "state\n"
-        mode = "state"
+args = sys.argv[1:]
 
-    else:
-        usage()
-        sys.exit(2)
+if len(args) == 1 and is_target(args[0]):
+    command = f"select {args[0]}\n"
+    mode = "select"
 
-elif len(sys.argv) == 3 and sys.argv[1] == "query":
-    name = sys.argv[2]
+elif len(args) == 2 and len(args[0]) == 1 and args[0].isalpha() and is_target(args[1]):
+    command = f"select {args[0]} {args[1]}\n"
+    mode = "select"
+
+elif len(args) == 1 and args[0] in ("state", "model"):
+    command = f"{args[0]}\n"
+    mode = args[0]
+
+elif len(args) == 2 and args[0] == "query":
+    name = args[1]
 
     if name not in QUERIES:
         print(f"Unknown query: {name}", file=sys.stderr)
@@ -70,8 +80,8 @@ elif len(sys.argv) == 3 and sys.argv[1] == "query":
     command = f"query {name}\n"
     mode = "query"
 
-elif len(sys.argv) == 4 and sys.argv[1] == "set":
-    command = f"set {sys.argv[2]} {sys.argv[3]}\n"
+elif len(args) == 3 and args[0] == "set":
+    command = f"set {args[1]} {args[2]}\n"
     mode = "set"
 
 else:
@@ -94,7 +104,7 @@ try:
 
     if not result.get("ok"):
         print(
-            result.get("error", "HKS401 command failed"),
+            result.get("error", "TESmart command failed"),
             file=sys.stderr,
         )
         sys.exit(1)
@@ -102,9 +112,12 @@ try:
     if mode == "state":
         print(json.dumps(result["state"], indent=2))
 
+    elif mode == "model":
+        print(json.dumps({"ready": result["ready"], "model": result["model"]}, indent=2))
+
     elif mode in ("query", "set"):
         print(json.dumps(result, indent=2))
 
 except Exception as ex:
-    print(f"HKS401 daemon error: {ex}", file=sys.stderr)
+    print(f"tesmartd error: {ex}", file=sys.stderr)
     sys.exit(1)

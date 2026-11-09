@@ -1,0 +1,213 @@
+#!/usr/bin/env python3
+"""Print the kvmd GPIO override (scheme + view) for the connected TESmart.
+
+The layout comes from tesmartd's resolved model (PC/output counts and
+supported features), so each unit only shows the controls it has.
+
+Usage: tesmart-kvmd-ui [--wait SECONDS] [--socket PATH]
+"""
+
+import argparse
+import json
+import socket
+import sys
+import time
+
+SWITCH = "{driver: tesmart_uart, pin: %s, mode: output, switch: true, pulse: {delay: 0}}"
+PULSE = "{driver: tesmart_uart, pin: %s, mode: output, switch: false, pulse: {delay: 0.1}}"
+INPUT = "{driver: tesmart_uart, pin: %s, mode: input}"
+
+TOGGLES = (
+    ("autoscan", "Auto Scan"),
+    ("buzzer", "Buzzer"),
+    ("mouse", "Mouse Wheel"),
+    ("audio_follow", "Audio Follow"),
+    ("auto_detect", "Auto Detect"),
+)
+
+
+def daemon_model(path, wait):
+    deadline = time.monotonic() + wait
+    reason = "no reply"
+    while True:
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+                s.settimeout(2)
+                s.connect(path)
+                s.sendall(b"model\n")
+                data = b""
+                while not data.endswith(b"\n"):
+                    chunk = s.recv(4096)
+                    if not chunk:
+                        break
+                    data += chunk
+            reply = json.loads(data)
+            if reply.get("ready") and reply.get("model"):
+                return reply["model"]
+            reason = "model unknown (is the KVM powered and connected?)" \
+                if reply.get("ready") else "startup snapshot not finished"
+        except (OSError, ValueError) as ex:
+            reason = str(ex)
+        if time.monotonic() >= deadline:
+            raise RuntimeError(reason)
+        time.sleep(0.5)
+
+
+def build(model):
+    pcs = model["pcs"]
+    letters = model["letters"]
+    features = set(model["features"])
+    pikvm = model["pikvm_output"]
+
+    scheme = {}
+    view = []
+
+    def switch(channel, pin):
+        scheme[channel] = SWITCH % pin
+        return f"{channel}|"
+
+    def pulse(channel, pin, text):
+        scheme[channel] = PULSE % pin
+        return f"{channel}|{text}"
+
+    # PC selection (all outputs). Lit button = keyboard/mouse focus.
+    title = f"#{model['name']} Input"
+    if len(letters) > 1:
+        title += " (all outputs)"
+    view.append([title])
+    per_row = 2 if pcs <= 4 else 4
+    for first in range(1, pcs + 1, per_row):
+        view.append([
+            switch(f"tesmart_pc{n}", f"pc{n}")
+            for n in range(first, min(first + per_row, pcs + 1))
+        ])
+    view.append([pulse("tesmart_pc_next", "pc_next", "Next PC")])
+
+    # Per-output selection.
+    if len(letters) > 1:
+        view.append([])
+        for letter in letters:
+            o = letter.lower()
+            label = f"#Monitor {letter}" + (" (PiKVM)" if letter == pikvm else "")
+            view.append([
+                label,
+                *(switch(f"tesmart_out_{o}_pc{n}", f"out_{o}_pc{n}") for n in range(1, pcs + 1)),
+                pulse(f"tesmart_out_{o}_next", f"out_{o}_next", "Next"),
+            ])
+
+    # On/off controls, two per row.
+    toggles = [
+        switch(f"tesmart_{name}", name)
+        for name, _ in TOGGLES
+        if name in features and not (name == "buzzer" and "buzzer_levels" in features)
+    ]
+    if toggles:
+        view.append([])
+        view.append(["#Controls"])
+        for i in range(0, len(toggles), 2):
+            view.append(toggles[i:i + 2])
+
+    # Multi-state controls. kvmd tables share column widths across rows, so
+    # rows of 72 px buttons share one table and each row of compact (52 px)
+    # PC buttons gets its own, or the buttons space unevenly.
+    wide = []
+    if "km_mode" in features:
+        wide.append(["#KM Mode", *(
+            switch(f"tesmart_km_{m}", f"km_{m}") for m in ("passthrough", "compatible")
+        )])
+    if "buzzer_levels" in features:
+        wide.append(["#Buzzer", *(
+            switch(f"tesmart_buzzer_{m}", f"buzzer_{m}") for m in ("off", "low", "medium", "high")
+        )])
+    if "lighting" in features:
+        wide.append(["#Lighting", *(
+            switch(f"tesmart_light_{m}", f"lighting_{m}")
+            for m in ("off", "indicator", "marquee", "breathing")
+        )])
+    if "fan" in features:
+        wide.append(["#Fan", *(
+            switch(f"tesmart_fan_{m}", f"fan_{m}") for m in ("off", "auto", "low", "high")
+        )])
+    if "network" in features:
+        nets = range(1, min(pcs, 8) + 1)
+        wide.append(["#Ethernet", *(
+            f"{switch(f'tesmart_net_pc{n}', f'net_pc{n}')}confirm|" for n in nets
+        )])
+        # Hidden LEDs; tesmart.css outlines the Ethernet button of the 0x89 focus PC.
+        for n in nets:
+            scheme[f"tesmart_netfocus_pc{n}"] = INPUT % f"net_focus_pc{n}"
+        wide.append(["#", *(f"tesmart_netfocus_pc{n}|green" for n in nets)])
+    if "scan_interval" in features:
+        wide.append(["#Auto Scan Interval", *(
+            switch(f"tesmart_scan_{s}", f"scan_{s}") for s in (5, 10, 15, 30, 60)
+        ), pulse("tesmart_scan_next", "scan_next", "Next")])
+    if wide:
+        view.append([])
+        view.extend(wide)
+
+    compact = []
+    if "audio" in features:
+        compact.append(["#Audio", *(
+            switch(f"tesmart_audio_pc{n}", f"audio_pc{n}") for n in range(1, pcs + 1)
+        ), pulse("tesmart_audio_next", "audio_next", "Next")])
+    if "mixed_focus" in features:
+        compact.append(["#Mixed K/M Focus", *(
+            switch(f"tesmart_mixed_pc{n}", f"mixed_pc{n}") for n in range(1, pcs + 1)
+        ), pulse("tesmart_mixed_next", "mixed_next", "Next")])
+    for row in compact:
+        view.append([])
+        view.append(row)
+
+    return scheme, view
+
+
+def render(model, scheme, view):
+    q = json.dumps
+    out = [
+        "# Generated by tesmart-kvmd-ui for "
+        f"{model['name']} ({model['pcs']} PCs, {model['outputs']} output(s)).",
+        "# Do not edit; change /etc/tesmart.conf and restart kvmd instead.",
+        "kvmd:",
+        "    gpio:",
+        "        drivers:",
+        "            tesmart_uart:",
+        "                type: tesmart_uart",
+        "                socket: /run/tesmartd.sock",
+        "                timeout: 1.0",
+        "                state_poll: 0.25",
+        "",
+        "        scheme:",
+    ]
+    width = max(len(c) for c in scheme) + 1
+    out += [f"            {(c + ':').ljust(width)} {v}" for c, v in scheme.items()]
+    out += [
+        "",
+        "        view:",
+        "            header:",
+        "                title: TESmart",
+        "            # [] starts a new table so each section gets its own column widths.",
+        "            table:",
+    ]
+    out += [f"                - [{', '.join(q(i) for i in row)}]" for row in view]
+    return "\n".join(out) + "\n"
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--wait", type=float, default=10.0,
+                        help="seconds to wait for tesmartd to settle the model")
+    parser.add_argument("--socket", default="/run/tesmartd.sock")
+    args = parser.parse_args()
+
+    try:
+        model = daemon_model(args.socket, args.wait)
+    except RuntimeError as ex:
+        print(f"tesmart-kvmd-ui: {ex}", file=sys.stderr)
+        sys.exit(1)
+
+    scheme, view = build(model)
+    sys.stdout.write(render(model, scheme, view))
+
+
+if __name__ == "__main__":
+    main()

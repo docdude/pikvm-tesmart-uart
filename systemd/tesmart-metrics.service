@@ -1,0 +1,11 @@
+[Unit]
+Description=TESmart KVM state metrics for node_exporter
+After=tesmartd.service
+
+[Service]
+ExecStart=/usr/local/bin/tesmart-metrics.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

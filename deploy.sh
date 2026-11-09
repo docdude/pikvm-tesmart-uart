@@ -51,6 +51,8 @@ install -Dm0755 pikvm/install-tesmart-kvmd-plugin   /usr/local/sbin/install-tesm
 install -Dm0644 systemd/tesmartd.service            /etc/systemd/system/tesmartd.service
 install -Dm0644 systemd/kvmd-tesmart.conf           /etc/systemd/system/kvmd.service.d/tesmart.conf
 install -Dm0644 udev/99-tesmart-uart.rules          /etc/udev/rules.d/99-tesmart-uart.rules
+install -Dm0755 metrics/tesmart-metrics.py          /usr/local/bin/tesmart-metrics.py
+install -Dm0644 systemd/tesmart-metrics.service     /etc/systemd/system/tesmart-metrics.service
 
 if [[ ! -f /etc/tesmart.conf ]]; then
     install -Dm0644 tesmart.conf.example /etc/tesmart.conf
@@ -75,6 +77,15 @@ fi
 systemctl daemon-reload
 systemctl enable tesmartd.service
 systemctl restart tesmartd
+
+# The Prometheus exporter is only useful with node_exporter's textfile
+# collector (reading /run/node_exporter), so run it only where that exists.
+if systemctl cat node_exporter.service >/dev/null 2>&1; then
+    systemctl enable tesmart-metrics.service
+    systemctl restart tesmart-metrics.service
+else
+    echo "node_exporter not installed; tesmart-metrics installed but not enabled."
+fi
 # kvmd's ExecStartPre runs install-tesmart-kvmd-plugin, which generates
 # /etc/kvmd/override.d/tesmart.yaml from tesmartd's model.
 systemctl restart kvmd

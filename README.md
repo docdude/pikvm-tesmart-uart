@@ -844,6 +844,28 @@ port N (API port `N-1`).
 
 Disable it with `SWITCH_LINK=0` in `/etc/tesmart.conf`.
 
+### Prometheus metrics
+
+`metrics/tesmart-metrics.py` (unit `tesmart-metrics.service`) writes
+`/run/node_exporter/tesmart.prom` every 15 s for node_exporter's textfile
+collector (`--collector.textfile.directory=/run/node_exporter`).
+`deploy.sh` enables it only when `node_exporter.service` exists.
+
+| Metric | Meaning |
+| --- | --- |
+| `tesmart_state_readable` | 1 if `/run/tesmartd-state.json` could be read |
+| `tesmart_link_up` | 1 if the last UART probe (`query focus` every 5 min) got a reply |
+| `tesmart_link_probe_timestamp_seconds` | When that probe ran |
+| `tesmart_info{model,pcs,outputs,pikvm_output}` | Detected model, always 1 |
+| `tesmart_active_pc`, `_focus_pc`, `_monitor_pc`, `_audio_pc`, `_mixed_focus_pc` | Current PCs |
+| `tesmart_output_pc{output}` | PC on each output |
+| `tesmart_setting{name,value}` | Buzzer, lighting, KM mode, mouse, fan, Audio Follow, Auto Scan, Auto Detect; always 1 |
+| `tesmart_network_port_enabled{pc}` | Ethernet switch state (HKS401) |
+| `tesmart_last_frame_timestamp_seconds` | Last UART frame from the KVM |
+
+To have node_exporter's systemd collector report the services as well,
+include `tesmart.*` in its `--collector.systemd.unit-include`.
+
 ### Surviving PiKVM updates
 
 The canonical plugin is kept under `/usr/local` because package files

@@ -882,7 +882,7 @@ No PiKVM-owned files are edited:
 Edit files in this repo, then deploy:
 
 ``` bash
-sudo bash /home/pikvm-hks401/deploy.sh
+sudo bash /home/pikvm-tesmart-uart/deploy.sh
 ```
 
 `deploy.sh` installs `/etc/tesmart.conf` if missing, enables `tesmartd`
